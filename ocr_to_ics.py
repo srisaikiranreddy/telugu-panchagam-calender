@@ -9,6 +9,7 @@ import pytesseract
 import requests
 from ics import Calendar, Event
 from PIL import Image, ImageOps
+import matplotlib.pyplot as plt
 
 # Configuration
 IMAGE_URL = "https://telugucalendar.org/calendar/2025/chicago/chicago-2025-9.png"
@@ -56,13 +57,19 @@ def run_ocr(img: Image.Image, langs: List[str] = None) -> Dict[str, str]:
             print(f"Warning: Tesseract failed for lang='{l}': {e}", file=sys.stderr)
         results[l] = text or ""
 
-    # combined: prefer Telugu text if present, but include both for debugging
-    combined = []
-    if results.get("eng"):
-        combined.append(f"[ENGLISH OCR]\n{results['eng'].strip()}")
-    if results.get("tel"):
-        combined.append(f"[TELUGU OCR]\n{results['tel'].strip()}")
-    results["combined"] = "\n\n".join(combined).strip()
+    # combined: interleave Telugu and English lines block by block
+    tel_lines = results.get("tel", "").splitlines()
+    eng_lines = results.get("eng", "").splitlines()
+    combined_lines = []
+
+    max_len = max(len(tel_lines), len(eng_lines))
+    for i in range(max_len):
+        if i < len(tel_lines):
+            combined_lines.append(tel_lines[i])
+        if i < len(eng_lines):
+            combined_lines.append(eng_lines[i])
+
+    results["combined"] = "\n".join(combined_lines).strip()
     return results
 
 
@@ -193,6 +200,31 @@ def build_calendar_and_csv(blocks: List[Dict], year: int, month: int) -> None:
         f.writelines(cal)
 
 
+def slice_calendar_grid_blocks(img, cols=7, rows=5, pad_top=100, pad_bottom=80, pad_left=50, pad_right=50):
+    blocks = []
+    inner_width = img.width - pad_left - pad_right
+    inner_height = img.height - pad_top - pad_bottom
+    block_width = inner_width // cols
+    block_height = inner_height // rows
+    for row in range(rows):
+        for col in range(cols):
+            left = pad_left + col * block_width
+            top = pad_top + row * block_height
+            right = left + block_width
+            bottom = top + block_height
+            block = img.crop((left, top, right, bottom))
+            blocks.append(((row + 1, col + 1), block))
+    return blocks
+
+def preview_calendar_grid_blocks(blocks):
+    for (row, col), block in blocks:
+        plt.figure(figsize=(4, 2))
+        plt.imshow(block, cmap='gray')
+        plt.title(f"Date Block R{row}C{col} (Day ~{(row-1)*7 + col})")
+        plt.axis('off')
+        plt.show()
+
+
 def main():
     try:
         if LOCAL_IMAGE_PATH:
@@ -201,6 +233,16 @@ def main():
             img = download_image(IMAGE_URL)
 
         proc = preprocess_image(img)
+
+        blocks = slice_calendar_grid_blocks(proc)
+        #preview_calendar_grid_blocks(blocks)
+
+        # Run OCR per block and print results
+        for (row, col), block_img in blocks:
+            print(f"\n--- OCR for Block R{row}C{col} ---")
+            block_ocr = run_ocr(block_img, langs=OCR_LANGS)
+            print(block_ocr.get("combined", "").strip())
+
         print("Running OCR for languages:", OCR_LANGS)
         ocr_results = run_ocr(proc, langs=OCR_LANGS)
 
