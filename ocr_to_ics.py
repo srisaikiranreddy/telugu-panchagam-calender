@@ -16,7 +16,7 @@ import numpy as np
 # Configuration
 IMAGE_URLS = [
     f"https://telugucalendar.org/calendar/2025/chicago/chicago-2025-{month}.png"
-    for month in range(1, 13)
+    for month in range(1, 2)
 ]
 # If you already have a local file, set LOCAL_IMAGE_PATH to that path and leave IMAGE_URLS = None
 LOCAL_IMAGE_PATH: Optional[str] = None  # e.g. "./calendar.png"
@@ -71,57 +71,62 @@ def detect_calendar_cells_via_contours(pil_image, min_area=1000, debug=False):
 
 def main():
     try:
-            for url in IMAGE_URLS:
-                print(f"Processing: {url}")
-                
-                img = download_image(url)
-                proc = preprocess_image(img)
-                blocks = detect_calendar_cells_via_contours(proc, debug=True)
-                
-                for (row, col), cell in blocks:
-                    if row == 5 and col == 5:
-                        width, height = cell.size
-                        num_rows = 5
-                        num_cols = 7
-                        cell_width = width // num_cols
-                        cell_height = height // num_rows
+        cal = Calendar()
+        for url in IMAGE_URLS:
+            print(f"Processing: {url}")
+            
+            img = download_image(url)
+            proc = preprocess_image(img)
+            blocks = detect_calendar_cells_via_contours(proc, debug=True)
+            
+            for (row, col), cell in blocks:
+                if row == 5 and col == 5:
+                    width, height = cell.size
+                    num_rows = 5
+                    num_cols = 7
+                    cell_width = width // num_cols
+                    cell_height = height // num_rows
 
-                        for sub_row in range(num_rows):
-                            for sub_col in range(num_cols):
-                                left = sub_col * cell_width
-                                upper = sub_row * cell_height
-                                right = (sub_col + 1) * cell_width
-                                lower = (sub_row + 1) * cell_height
-                                sub_cell = cell.crop((left, upper, right, lower))
+                    for sub_row in range(num_rows):
+                        for sub_col in range(num_cols):
+                            left = sub_col * cell_width
+                            upper = sub_row * cell_height
+                            right = (sub_col + 1) * cell_width
+                            lower = (sub_row + 1) * cell_height
+                            sub_cell = cell.crop((left, upper, right, lower))
 
-                                plt.figure(figsize=(2.5, 2.5))
-                                plt.imshow(sub_cell, cmap='gray')
-                                plt.title(f"Block 5-5 → Cell ({sub_row+1},{sub_col+1})", fontsize=8)
-                                plt.axis('off')
-                                plt.tight_layout()
-                                plt.show()
+                            plt.figure(figsize=(2.5, 2.5))
+                            plt.imshow(sub_cell, cmap='gray')
+                            plt.title(f"Block 5-5 → Cell ({sub_row+1},{sub_col+1})", fontsize=8)
+                            plt.axis('off')
+                            plt.tight_layout()
+                            plt.show()
 
-                                eng_text = pytesseract.image_to_string(sub_cell, lang="eng").strip()
-                                tel_text = pytesseract.image_to_string(sub_cell, lang="tel").strip()
-                                tel_lines = [line.strip() for line in tel_text.split("\n") if line.strip()]
-                                for idx, tel_line in enumerate(tel_lines, 1):
-                                    print(f"Telugu Line {idx}: {tel_line}")
+                            eng_text = pytesseract.image_to_string(sub_cell, lang="eng").strip()
+                            tel_text = pytesseract.image_to_string(sub_cell, lang="tel").strip()
 
-                                # Attempt to extract a date number from English OCR
-                                date_match = re.search(r'\b([1-9]|[12][0-9]|3[01])\b', eng_text)
-                                if date_match:
-                                    calendar_date = int(date_match.group(1))
-                                    month_match = re.search(r'(\d{4})-(\d{1,2})', url)
-                                    year, month = month_match.groups()
-                                    print(f"Date: {calendar_date}-{month}-{year}")
-                                    print(f"Tithi & Nakshatram: {tel_text}")
-                                    print("-" * 40)
-
+                            # Attempt to extract a date number from English OCR
+                            date_match = re.search(r'\b([1-9]|[12][0-9]|3[01])\b', eng_text)
+                            if date_match:
+                                calendar_date = int(date_match.group(1))
+                                month_match = re.search(r'(\d{4})-(\d{1,2})', url)
+                                year, month = month_match.groups()
+                                print(f"Date: {calendar_date}-{month}-{year}")
+                                print(f"Tithi & Nakshatram: {tel_text}")
                                 
+                                event_date = date(int(year), int(month), int(calendar_date))
+                                event = Event()
+                                event.name = tel_text
+                                event.begin = event_date.isoformat()
+                                cal.events.add(event)
 
     except Exception as exc:
         print("Error:", exc, file=sys.stderr)
         sys.exit(1)
+
+    with open(OUTPUT_ICS, "w", encoding="utf-8") as f:
+        f.writelines(cal)
+    print(f"ICS calendar saved to {OUTPUT_ICS}")
 
 
 if __name__ == "__main__":
