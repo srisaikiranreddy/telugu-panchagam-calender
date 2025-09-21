@@ -10,10 +10,15 @@ import requests
 from ics import Calendar, Event
 from PIL import Image, ImageOps
 import matplotlib.pyplot as plt
+import cv2
+import numpy as np
 
 # Configuration
-IMAGE_URL = "https://telugucalendar.org/calendar/2025/chicago/chicago-2025-9.png"
-# If you already have a local file, set LOCAL_IMAGE_PATH to that path and leave IMAGE_URL = None
+IMAGE_URLS = [
+    f"https://telugucalendar.org/calendar/2025/chicago/chicago-2025-{month}.png"
+    for month in range(1, 13)
+]
+# If you already have a local file, set LOCAL_IMAGE_PATH to that path and leave IMAGE_URLS = None
 LOCAL_IMAGE_PATH: Optional[str] = None  # e.g. "./calendar.png"
 # process both languages
 OCR_LANGS = ["eng", "tel"]  # runs OCR for English and Telugu
@@ -39,252 +44,100 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     # Return a higher-resolution image to improve OCR accuracy
     return bw.resize((bw.width * 2, bw.height * 2), Image.LANCZOS)
 
+def detect_calendar_cells_via_contours(pil_image, min_area=1000, debug=False):
+    open_cv_image = np.array(pil_image.convert("L"))
+    _, thresh = cv2.threshold(open_cv_image, 200, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-def run_ocr(img: Image.Image, langs: List[str] = None) -> Dict[str, str]:
-    """
-    Run Tesseract for each language in langs and return a dict:
-      { 'eng': '...', 'tel': '...', 'combined': 'eng_text\\n\\ntel_text' }
-    """
-    if langs is None:
-        langs = ["eng"]
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w * h > min_area and w > 50 and h > 50:
+            boxes.append((y, x, w, h))
 
-    results: Dict[str, str] = {}
-    for l in langs:
-        try:
-            text = pytesseract.image_to_string(img, lang=l)
-        except pytesseract.TesseractError as e:
-            text = ""
-            print(f"Warning: Tesseract failed for lang='{l}': {e}", file=sys.stderr)
-        results[l] = text or ""
-
-    # combined: interleave Telugu and English lines block by block
-    tel_lines = results.get("tel", "").splitlines()
-    eng_lines = results.get("eng", "").splitlines()
-    combined_lines = []
-
-    max_len = max(len(tel_lines), len(eng_lines))
-    for i in range(max_len):
-        if i < len(tel_lines):
-            combined_lines.append(tel_lines[i])
-        if i < len(eng_lines):
-            combined_lines.append(eng_lines[i])
-
-    results["combined"] = "\n".join(combined_lines).strip()
-    return results
-
-
-def split_into_date_blocks(raw_text: str) -> List[Dict]:
-    """
-    Heuristic: split OCR text into blocks per date.
-    We look for lines that start with a day number (1-31) or contain a standalone day number.
-    If no headers found, fallback to splitting into 30 equal blocks.
-    """
-    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip() != ""]
-    date_header_re = re.compile(r"^(?:Day\s*)?(\b[1-9]\b|\b[1-2][0-9]\b|\b3[01]\b)\b", re.IGNORECASE)
-    blocks: List[Dict] = []
-    current_block_lines: List[str] = []
-    current_day: Optional[int] = None
-
-    for ln in lines:
-        m = date_header_re.match(ln)
-        if m:
-            # start new block
-            if current_block_lines:
-                blocks.append({"day": current_day, "text": "\n".join(current_block_lines)})
-            current_day = int(m.group(1))
-            # include the header line but remove the day number for cleaner text
-            rest = date_header_re.sub("", ln).strip()
-            current_block_lines = [rest] if rest else []
-        else:
-            current_block_lines.append(ln)
-
-    if current_block_lines:
-        blocks.append({"day": current_day, "text": "\n".join(current_block_lines)})
-
-    # If no day numbers detected, fallback: split into 30 parts
-    if all(b["day"] is None for b in blocks) or not blocks:
-        raw_lines = [ln for ln in raw_text.splitlines() if ln.strip() != ""]
-        n = 30
-        chunk_size = max(1, len(raw_lines) // n)
-        blocks = []
-        day = 1
-        for i in range(0, len(raw_lines), chunk_size):
-            chunk = raw_lines[i : i + chunk_size]
-            blocks.append({"day": day if day <= 31 else None, "text": "\n".join(chunk)})
-            day += 1
-
-    # Fill missing day numbers by sequence where possible
-    last_day = None
-    for b in blocks:
-        if b["day"] is None and last_day is not None:
-            b["day"] = last_day + 1
-        last_day = b["day"]
-
-    return blocks
-
-
-def extract_fields_from_block(block_text: str) -> Dict:
-    """
-    Try to extract tithi, nakshatra, and times using simple regex heuristics.
-    Keep everything flexible — if not found, leave empty and keep raw text.
-    """
-    # common time formats
-    time_re = re.compile(r"(\d{1,2}[:.]\d{2})\s*(AM|PM|am|pm)?")
-    # keywords for tithi/nakshatra (English heuristics)
-    tithi_re = re.compile(r"(Tithi[:\s-]*([A-Za-z0-9 \-]+))", re.IGNORECASE)
-    nak_re = re.compile(r"(Nakshatra[:\s-]*([A-Za-z0-9 \-]+))", re.IGNORECASE)
-
-    times = time_re.findall(block_text)
-    times_extracted = ["".join(t).strip() for t in times] if times else []
-
-    tithi_m = tithi_re.search(block_text)
-    nak_m = nak_re.search(block_text)
-
-    tithi = tithi_m.group(2).strip() if tithi_m else ""
-    nakshatra = nak_m.group(2).strip() if nak_m else ""
-
-    return {
-        "raw": block_text,
-        "tithi": tithi,
-        "nakshatra": nakshatra,
-        "times": "; ".join(times_extracted),
-    }
-
-
-def build_calendar_and_csv(blocks: List[Dict], year: int, month: int) -> None:
-    rows = []
-    cal = Calendar()
-
-    for b in blocks:
-        day = b.get("day")
-        if not isinstance(day, int) or day < 1 or day > 31:
-            continue
-        fields = extract_fields_from_block(b["text"])
-        try:
-            evt_date = date(year, month, day)
-        except Exception:
-            # skip invalid dates
-            continue
-
-        # create ICS event (all-day event with details in description)
-        e = Event()
-        e.name = f"Telugu Panchangam {evt_date.isoformat()}"
-        e.begin = evt_date.isoformat()
-        desc_lines = []
-        if fields["tithi"]:
-            desc_lines.append(f"Tithi: {fields['tithi']}")
-        if fields["nakshatra"]:
-            desc_lines.append(f"Nakshatra: {fields['nakshatra']}")
-        if fields["times"]:
-            desc_lines.append(f"Times: {fields['times']}")
-        desc_lines.append("Raw OCR:\n" + fields["raw"])
-        e.description = "\n".join(desc_lines)
-        cal.events.add(e)
-
-        rows.append(
-            {
-                "date": evt_date.isoformat(),
-                "tithi": fields["tithi"],
-                "nakshatra": fields["nakshatra"],
-                "times": fields["times"],
-                "raw_text": fields["raw"],
-            }
-        )
-
-    # save CSV
-    df = pd.DataFrame(rows)
-    df.to_csv(OUTPUT_CSV, index=False)
-
-    # save ICS
-    with open(OUTPUT_ICS, "w", encoding="utf-8") as f:
-        f.writelines(cal)
-
-
-def slice_calendar_grid_blocks(img, cols=7, rows=5, pad_top=100, pad_bottom=80, pad_left=50, pad_right=50):
+    boxes.sort()
+    sorted_cells = sorted(boxes, key=lambda b: (b[0] // 50, b[1]))
     blocks = []
-    inner_width = img.width - pad_left - pad_right
-    inner_height = img.height - pad_top - pad_bottom
-    block_width = inner_width // cols
-    block_height = inner_height // rows
-    for row in range(rows):
-        for col in range(cols):
-            left = pad_left + col * block_width
-            top = pad_top + row * block_height
-            right = left + block_width
-            bottom = top + block_height
-            block = img.crop((left, top, right, bottom))
-            blocks.append(((row + 1, col + 1), block))
-    return blocks
 
-def preview_calendar_grid_blocks(blocks):
-    for (row, col), block in blocks:
-        plt.figure(figsize=(4, 2))
-        plt.imshow(block, cmap='gray')
-        plt.title(f"Date Block R{row}C{col} (Day ~{(row-1)*7 + col})")
-        plt.axis('off')
-        plt.show()
+    for idx, (y, x, w, h) in enumerate(sorted_cells):
+        cell = pil_image.crop((x, y, x + w, y + h))
+        row = idx // 7 + 1
+        col = idx % 7 + 1
+        blocks.append(((row, col), cell))
+        if debug:
+            plt.figure(figsize=(2, 2))
+            plt.imshow(cell, cmap='gray')
+            plt.title(f"Block {row}-{col}")
+            plt.axis('off')
+            plt.show()
+
+    return blocks
 
 
 def main():
     try:
         if LOCAL_IMAGE_PATH:
             img = open_local_image(LOCAL_IMAGE_PATH)
+            proc = preprocess_image(img)
+            blocks = detect_calendar_cells_via_contours(proc, debug=True)
+            
+            for (row, col), cell in blocks:
+                if row == 5 and col == 5:
+                    width, height = cell.size
+                    num_rows = 5
+                    num_cols = 7
+                    cell_width = width // num_cols
+                    cell_height = height // num_rows
+
+                    for sub_row in range(num_rows):
+                        for sub_col in range(num_cols):
+                            left = sub_col * cell_width
+                            upper = sub_row * cell_height
+                            right = (sub_col + 1) * cell_width
+                            lower = (sub_row + 1) * cell_height
+                            sub_cell = cell.crop((left, upper, right, lower))
+
+                            plt.figure(figsize=(2.5, 2.5))
+                            plt.imshow(sub_cell, cmap='gray')
+                            plt.title(f"Block 5-5 → Cell ({sub_row+1},{sub_col+1})", fontsize=8)
+                            plt.axis('off')
+                            plt.tight_layout()
+                            plt.show()
+            
         else:
-            img = download_image(IMAGE_URL)
+            for url in IMAGE_URLS:
+                print(f"Processing: {url}")
+                img = download_image(url)
+                proc = preprocess_image(img)
+                blocks = detect_calendar_cells_via_contours(proc, debug=True)
+                
+                for (row, col), cell in blocks:
+                    if row == 5 and col == 5:
+                        width, height = cell.size
+                        num_rows = 5
+                        num_cols = 7
+                        cell_width = width // num_cols
+                        cell_height = height // num_rows
 
-        proc = preprocess_image(img)
+                        for sub_row in range(num_rows):
+                            for sub_col in range(num_cols):
+                                left = sub_col * cell_width
+                                upper = sub_row * cell_height
+                                right = (sub_col + 1) * cell_width
+                                lower = (sub_row + 1) * cell_height
+                                sub_cell = cell.crop((left, upper, right, lower))
 
-        blocks = slice_calendar_grid_blocks(proc)
-        #preview_calendar_grid_blocks(blocks)
+                                plt.figure(figsize=(2.5, 2.5))
+                                plt.imshow(sub_cell, cmap='gray')
+                                plt.title(f"Block 5-5 → Cell ({sub_row+1},{sub_col+1})", fontsize=8)
+                                plt.axis('off')
+                                plt.tight_layout()
+                                plt.show()
 
-        # Run OCR per block and print results
-        for (row, col), block_img in blocks:
-            print(f"\n--- OCR for Block R{row}C{col} ---")
-            block_ocr = run_ocr(block_img, langs=OCR_LANGS)
-            print(block_ocr.get("combined", "").strip())
+            d = []
 
-        print("Running OCR for languages:", OCR_LANGS)
-        ocr_results = run_ocr(proc, langs=OCR_LANGS)
-
-        # prefer Telugu combined if you want Telugu-first parsing; use 'combined' for full output
-        raw_text = ocr_results.get("combined", "")
-        if not raw_text.strip():
-            print("Warning: OCR returned empty text.", file=sys.stderr)
-
-        # optional: debug print of per-language outputs
-        print("\n--- OCR per language (short preview) ---")
-        for lang in OCR_LANGS:
-            preview = (ocr_results.get(lang) or "").strip()[:1000]
-            print(f"\n[{lang}] preview:\n{preview}\n")
-        print("--- end preview ---\n")
-
-        blocks = split_into_date_blocks(raw_text)
-        # Guess month/year from image URL if possible (simple heuristic)
-        m = re.search(r"(\d{4}).*?[-_/](\d{1,2})", IMAGE_URL or "") if IMAGE_URL else None
-        if m:
-            year = int(m.group(1))
-            month = int(m.group(2))
-        else:
-            # fallback: ask user or default to current month
-            today = datetime.now()
-            year = today.year
-            month = today.month
-
-        # Print parsed output for each block before building calendar/CSV
-        print("\nParsed OCR blocks (preview):\n")
-        for b in blocks:
-            day = b.get("day")
-            print(f"--- Day: {day} ---")
-            print("OCR text:")
-            print(b["text"])
-            fields = extract_fields_from_block(b["text"])
-            print("Parsed fields:")
-            for k, v in fields.items():
-                print(f"  {k}: {v}")
-            print("-" * 60)
-
-        build_calendar_and_csv(blocks, year, month)
-        print(f"\nDone. CSV -> {OUTPUT_CSV}  ICS -> {OUTPUT_ICS}")
+        data = []
+       
     except Exception as exc:
         print("Error:", exc, file=sys.stderr)
         sys.exit(1)
